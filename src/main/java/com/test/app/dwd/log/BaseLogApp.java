@@ -62,6 +62,10 @@ public class BaseLogApp {
         DataStreamSource<String> source = env.addSource(KafkaUtil.getKafkaConsumer(topic, groupId));
 
         //TODO 4.数据清洗，转换结构
+        /**
+         * 对流中数据进行解析，将字符串转换为 JSONObject，如果解析报错则必然为脏数据。
+         * 定义侧输出流，将脏数据发送到侧输出流，写入 Kafka 脏数据主题
+         */
         //4.1 定义错误输出流
         OutputTag<String> dirtyStreamTag = new OutputTag<String>("dirtyStream") {
 
@@ -87,6 +91,20 @@ public class BaseLogApp {
         SingleOutputStreamOperator<JSONObject> mappedStream = cleanedStream.map(JSON::parseObject);
 
         // TODO 5. 新老访客状态标记修复
+        /**
+         * 新老访客状态标记修复思路
+         * 运用 Flink 状态编程，为每个 mid 维护一个键控状态，记录首次访问日期
+         * ①如果 is_new 的值为 1
+         * a）如果键控状态为 null，认为本次是该访客首次访问 APP，将日志中 ts 对应的日期更新到状态中，不对 is_new 字段做修改；
+         * b）如果键控状态不为 null，且首次访问日期不是当日，说明访问的是老访客，将 is_new 字段置为 0；
+         * c）如果键控状态不为 null，且首次访问日期是当日，说明访问的是新访客，不做操作；
+         *
+         * ②如果 is_new 的值为 0
+         * a）如果键控状态为 null，说明访问 APP 的是老访客但本次是该访客的页面日志首次进入程序。
+         * 当前端新老访客状态标记丢失时，日志进入程序被判定为老访客，Flink 程序就可以纠正被误判的访客状态标记，
+         * 只要将状态中的日期设置为今天之前即可。本程序选择将状态更新为昨日；
+         * b）如果键控状态不为 null，说明程序已经维护了首次访问日期，不做操作。
+         */
         //5.1 按照mid对数据进行分组
         KeyedStream<JSONObject, String> keyedStream = mappedStream.keyBy(r -> r.getJSONObject("common").getString("mid"));
 
@@ -131,6 +149,39 @@ public class BaseLogApp {
         });
 
         //TODO 6. 分流
+        /**
+         * 利用侧输出流实现数据拆分
+         * （1）埋点日志结构分析
+         * 前端埋点获取的 JSON 字符串（日志）可能存在 common、start、page、displays、actions、err 六种字段。其中
+         * 	common 对应的是公共信息，是所有日志都有的字段
+         * 	err 对应的是错误信息，所有日志都可能有的字段
+         * 	start 对应的是启动信息，启动日志才有的字段
+         * 	page 对应的是页面信息，页面日志才有的字段
+         * 	displays 对应的是曝光信息，曝光日志才有的字段，曝光日志可以归为页面日志，因此必然有 page 字段
+         * 	actions 对应的是动作信息，动作日志才有的字段，同样属于页面日志，必然有 page 字段。动作信息和曝光信息可以同时存在。
+         * 	ts 对应的是时间戳，单位：毫秒，所有日志都有的字段
+         * 综上，我们可以将前端埋点获取的日志分为两大类：启动日志和页面日志。二者都有 common 字段和 ts 字段，都可能有 err 字段。
+         * 页面日志一定有 page 字段，一定没有 start 字段，可能有 displays 和 actions 字段；
+         * 启动日志一定有 start 字段，一定没有 page、displays 和 actions 字段。
+         *
+         * （2）分流日志分类
+         * 本节将按照内容，将日志分为以下五类
+         * 	启动日志
+         * 	页面日志
+         * 	曝光日志
+         * 	动作日志
+         * 	错误日志
+         *
+         * （3）分流思路
+         * ①所有日志数据都可能拥有 err 字段，所以首先获取 err 字段，如果返回值不为 null 则将整条日志数据发送到错误侧输出流。然后删掉 JSONObject 中的 err 字段及对应值；
+         * ②判断是否有 start 字段，如果有则说明数据为启动日志，将其发送到启动侧输出流；如果没有则说明为页面日志，进行下一步；
+         * ③页面日志必然有 page 字段、 common 字段和 ts 字段，获取它们的值，ts 封装为包装类 Long，其余两个字段的值封装为 JSONObject；
+         * ④判断是否有 displays 字段，如果有，将其值封装为 JSONArray，遍历该数组，依次获取每个元素（记为 display），封装为JSONObject。
+         * 创建一个空的 JSONObject，将 display、common、page和 ts 添加到该对象中，获得处理好的曝光数据，发送到曝光侧输出流。
+         * 动作日志的处理与曝光日志相同（注意：一条页面日志可能既有曝光数据又有动作数据，二者没有任何关系，因此曝光数据不为 null 时仍要对动作数据进行处理）；
+         * ⑤动作日志和曝光日志处理结束后删除 displays 和 actions 字段，此时主流的 JSONObject 中只有 common 字段、 page 字段和 ts 字段，即为最终的页面日志。
+         * 	处理结束后，页面日志数据位于主流，其余四种日志分别位于对应的侧输出流，将五条流的数据写入 Kafka 对应主题即可。
+         */
         //6.1定义启动、曝光、动作、错误侧输出流
         OutputTag<String> startTag = new OutputTag<String>("startTag"){
 

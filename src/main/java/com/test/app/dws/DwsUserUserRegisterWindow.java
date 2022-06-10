@@ -26,6 +26,8 @@ import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.util.Collector;
 
 /**
+ * addSource -> streamOperator ->  windowed -> aggregated
+ *
  * 用户域用户注册各窗口汇总表
  *  主要任务:
  * 	从 DWD 层用户注册表中读取数据，统计各窗口注册用户数，写入 ClickHouse。

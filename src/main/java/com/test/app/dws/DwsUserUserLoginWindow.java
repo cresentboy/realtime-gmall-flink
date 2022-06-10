@@ -2,20 +2,63 @@ package com.test.app.dws;
 
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
+import com.test.bean.UserLoginBean;
+import com.test.utils.ClickHouseUtil;
+import com.test.utils.DateFormatUtil;
 import com.test.utils.KafkaUtil;
+import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.time.Time;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.AllWindowedStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.datastream.KeyedStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.util.Collector;
 
+/**
+ * 10.4 用户域用户登陆各窗口汇总表
+ * 10.4.1 主要任务
+ * 从 Kafka 页面日志主题读取数据，统计七日回流用户和当日独立用户数。
+ * 10.4.2 思路分析
+ * 之前的活跃用户，一段时间未活跃（流失），今日又活跃了，就称为回流用户。此处要求统计回流用户总数。规定当日登陆，且自上次登陆之后至少 7 日未登录的用户为回流用户。
+ * 1）读取 Kafka 页面主题数据
+ * 2）转换数据结构
+ * 	流中数据由 String 转换为 JSONObject。
+ * 3）过滤数据
+ * 4）设置水位线
+ * 5）按照 uid 分组
+ * 	不同用户的登陆记录互不相干，各自处理。
+ * 6）统计回流用户数和独立用户数
+ * 	运用 Flink 状态编程，记录用户末次登陆日期。
+ * （1）若状态中的末次登陆日期不为 null，进一步判断。
+ * ① 如果末次登陆日期不等于当天日期则独立用户数 uuCt 记为 1，并将状态中的末次登陆日期更新为当日，进一步判断。
+ * a）如果当天日期与末次登陆日期之差大于等于 8 天则回流用户数 backCt 置为 1。
+ * b）否则 backCt 置为 0。
+ * ② 若末次登陆日期为当天，则 uuCt 和 backCt 均为 0，此时本条数据不会影响统计结果，舍弃，不再发往下游。
+ * （2）如果状态中的末次登陆日期为 null，将 uuCt 置为 1，backCt 置为 0，并将状态中的末次登陆日期更新为当日。
+ * 7）开窗，聚合
+ * 度量字段求和，补充窗口起始和结束时间，时间戳字段置为当前系统时间，用于 ClickHouse 数据去重。
+ * 8）写入 ClickHouse
+ *
+ */
 public class DwsUserUserLoginWindow {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
 
         // TODO 1. 环境准备
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -61,6 +104,120 @@ public class DwsUserUserLoginWindow {
                     }
                 }
         );
+
+        // TODO 6. 设置水位线
+        SingleOutputStreamOperator<JSONObject> streamOperator = filteredStream.assignTimestampsAndWatermarks(
+                WatermarkStrategy
+                        .<JSONObject>forMonotonousTimestamps()
+                        .withTimestampAssigner(
+                                new SerializableTimestampAssigner<JSONObject>() {
+                                    @Override
+                                    public long extractTimestamp(JSONObject jsonObj, long recordTimestamp) {
+                                        return jsonObj.getLong("ts");
+                                    }
+                                }
+                        )
+        );
+
+        // TODO 7. 按照 uid 分组
+        KeyedStream<JSONObject, String> keyedStream = streamOperator.keyBy(r -> r.getJSONObject("common").getString("uid"));
+
+        //TODO 8. 状态编程，保留回流页面浏览记录和独立用户登录记录
+        SingleOutputStreamOperator<UserLoginBean> backUniqueUserStream = keyedStream.process(
+                new KeyedProcessFunction<String, JSONObject, UserLoginBean>() {
+
+                    private ValueState<String> lastLoginDtState;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        super.open(parameters);
+                        lastLoginDtState = getRuntimeContext().getState(
+                                new ValueStateDescriptor<String>("last_login_dt", String.class)
+                        );
+                    }
+
+                    @Override
+                    public void processElement(JSONObject jsonObject, KeyedProcessFunction<String, JSONObject, UserLoginBean>.Context context, Collector<UserLoginBean> collector) throws Exception {
+                        String lastLoginDt = lastLoginDtState.value();
+
+                        //定义度量，统计回流用户数和独立用户数
+                        long backCt = 0L;
+                        long uuCt = 0L;
+
+                        //获取本次登录日期
+                        Long ts = jsonObject.getLong("ts");
+                        String loginDt = DateFormatUtil.toDate(ts);
+                        if (lastLoginDt != null) {
+                            //判断上次登录日期是否为当日
+                            if (!loginDt.equals(lastLoginDt)) {
+                                uuCt = 1L;
+                                //判断是否为回流用户
+                                //计算本次和上次登录时间的差值
+                                Long lastLoginTs = DateFormatUtil.toTs(lastLoginDt);
+                                long days = (ts - lastLoginTs) / 1000 / 3600 / 24;
+                                if (days >= 8) {
+                                    backCt = 1L;
+                                }
+                                lastLoginDtState.update(loginDt);
+                            }
+                        }else {
+                            uuCt = 1L;
+                            lastLoginDtState.update(loginDt);
+                        }
+                        //弱回流用户数和独立用户数均为0，则本条数据对统计无用，舍弃
+                        if(backCt !=0 || uuCt !=0){
+                            collector.collect(
+                                    new UserLoginBean(
+                                            "",
+                                            "",
+                                            backCt,
+                                            uuCt,
+                                            ts
+                                    )
+                            );
+                        }
+                    }
+                }
+        );
+
+        //TODO 9. 开窗
+        AllWindowedStream<UserLoginBean, TimeWindow> windowStream = backUniqueUserStream.windowAll(TumblingEventTimeWindows.of(
+                org.apache.flink.streaming.api.windowing.time.Time.seconds(10L)
+        ));
+
+        //TODO 10.聚合
+        SingleOutputStreamOperator<UserLoginBean> reducedStream = windowStream.reduce(
+                new ReduceFunction<UserLoginBean>() {
+                    @Override
+                    public UserLoginBean reduce(UserLoginBean value1, UserLoginBean value2) throws Exception {
+                        value1.setBackCt(value1.getBackCt() + value2.getBackCt());
+                        value1.setUuCt(value1.getUuCt() + value2.getUuCt());
+                        return value1;
+                    }
+                },
+                new ProcessAllWindowFunction<UserLoginBean, UserLoginBean, TimeWindow>() {
+                    @Override
+                    public void process(ProcessAllWindowFunction<UserLoginBean, UserLoginBean, TimeWindow>.Context context, Iterable<UserLoginBean> iterable, Collector<UserLoginBean> collector) throws Exception {
+                        String stt = DateFormatUtil.toYmdHms(context.window().getStart());
+                        String edt = DateFormatUtil.toYmdHms(context.window().getEnd());
+                        for (UserLoginBean element : iterable) {
+                            element.setStt(stt);
+                            element.setEdt(edt);
+                            element.setTs(System.currentTimeMillis());
+                            collector.collect(element);
+                        }
+                    }
+                }
+        );
+
+        //TODO 11. 写入OLAP数据库
+        SinkFunction<UserLoginBean> jdbcSink = ClickHouseUtil.<UserLoginBean>getJdbcSink(
+                "insert into dws_user_user_login_window values(?,?,?,?,?)"
+        );
+        reducedStream.addSink(jdbcSink);
+
+        env.execute();
+
 
     }
 }

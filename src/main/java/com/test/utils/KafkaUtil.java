@@ -13,9 +13,15 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import javax.annotation.Nullable;
 import java.util.Properties;
 
+/**
+ * 和 Kafka 交互要用到 Flink 提供的 FlinkKafkaConsumer、FlinkKafkaProducer 类，为了提高模板代码的复用性，将其封装到 KafkaUtil 工具类中。
+ */
 public class KafkaUtil {
     static String BOOTSTRAP_SERVERS = "hadoop102:9092,hadoop103:9092,hadoop104:9092";
     static String DEFAULT_TOPIC = "default_topic";
+
+
+
 
     public static FlinkKafkaConsumer<String> getKafkaConsumer(String topic,String groupId){
 

@@ -50,12 +50,18 @@ public class MyBroadcastFunction extends BroadcastProcessFunction<JSONObject,Str
             JSONObject data = jsonObject.getJSONObject("data");
             String sinkTable = tableConfig.getSinkTable();
 
+            //二次添加
+            String type = jsonObject.getString("type");
+
             //根据sinkColumns 过滤数据
             String sinkColumns = tableConfig.getSinkColumns();
             filterColumns(data,sinkColumns);
 
             //将目标表名加入到主流数据中
             data.put("sinkTable",sinkTable);
+
+            //二次添加
+            data.put("type", type);
             collector.collect(data);
         }
 

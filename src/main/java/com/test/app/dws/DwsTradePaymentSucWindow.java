@@ -51,8 +51,6 @@ import org.apache.flink.util.Collector;
  * 度量字段求和，补充窗口起始时间和结束时间字段，ts 字段置为当前系统时间戳。
  * 8）写出到 ClickHouse
  *
- *
- *
  */
 public class DwsTradePaymentSucWindow {
     public static void main(String[] args) throws Exception {
